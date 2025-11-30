@@ -1,0 +1,191 @@
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk, ImageDraw, ImageFont
+import threading
+import time
+import json
+import os
+import RPi.GPIO as GPIO
+from flask import Flask, request
+import socket
+import platform
+
+# ================= GPIO =================
+BUZZER_PIN = 22
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+buzzer = GPIO.PWM(BUZZER_PIN, 2000)
+buzzer_running = False
+
+def buzz_on(): 
+    global buzzer_running
+    if not buzzer_running:
+        buzzer.start(50)
+        buzzer_running = True
+
+def buzz_off():
+    global buzzer_running
+    if buzzer_running:
+        buzzer.stop()
+        buzzer_running = False
+
+# ================= DATA =================
+bots = {}   # dynamic — ESP bots
+demo = ["Demo Bot 1", "Demo Bot 2", "Demo Bot 3"]
+
+for d in demo:
+    bots[d] = {
+        "temp":"--","humi":"--","fire":0,
+        "gps":"--","status":"SAFE",
+        "time":time.time(),
+        "is_demo":True
+    }
+
+# ================= FLASK =================
+app = Flask(__name__)
+
+@app.route("/update", methods=["POST"])
+def update_bot():
+    data = request.get_json()
+    name = data["name"]
+
+    bots[name] = {
+        "temp":data["temp"],
+        "humi":data["humi"],
+        "fire":data["fire"],
+        "gps":data["gps"],
+        "status":data["status"],
+        "time":time.time(),
+        "is_demo":False
+    }
+    refresh_table()
+    if selected_bot == name:
+        load_dashboard(name)
+    return "OK"
+
+flask_thread = threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5000), daemon=True)
+flask_thread.start()
+
+# ================= UI =================
+root = tk.Tk()
+root.title("FireSense V4 Dashboard")
+root.geometry("1280x720")
+root.configure(bg="white")
+
+page1 = tk.Frame(root, bg="white")
+page2 = tk.Frame(root, bg="white")
+for p in (page1, page2): p.place(relwidth=1, relheight=1)
+
+# ---- Logo ----
+if os.path.exists("FireSense Logo.png"):
+    img = Image.open("FireSense Logo.png")
+else:
+    img = Image.new("RGBA",(180,180),(10,61,145))
+    d = ImageDraw.Draw(img); d.text((40,80),"LOGO",fill="white")
+img = img.resize((140,140))
+logo = ImageTk.PhotoImage(img)
+tk.Label(page1, image=logo, bg="white").pack(pady=10)
+
+# ---- Table ----
+cols = ("name","status","time")
+tree = ttk.Treeview(page1, columns=cols, show="headings", height=14)
+tree.heading("name",text="Name")
+tree.heading("status",text="Status")
+tree.heading("time",text="Last Update")
+tree.pack(fill="both",expand=True,padx=30,pady=10)
+
+# ---- Page2 widgets ----
+title = tk.Label(page2, text="", font=("Arial",22,"bold"), bg="white")
+title.pack(pady=5)
+
+status_text = tk.Label(page2, text="Status: --", font=("Arial",20), bg="white")
+status_text.pack(pady=3)
+
+temp_text = tk.Label(page2, text="Temp: --", font=("Arial",18), bg="white")
+temp_text.pack(anchor="w", padx=20)
+humi_text = tk.Label(page2, text="Humidity: --", font=("Arial",18), bg="white")
+humi_text.pack(anchor="w", padx=20)
+fire_text = tk.Label(page2, text="Fire: --", font=("Arial",18), bg="white")
+fire_text.pack(anchor="w", padx=20)
+gps_text  = tk.Label(page2, text="GPS: --", font=("Arial",18), bg="white")
+gps_text.pack(anchor="w", padx=20)
+time_text = tk.Label(page2, text="TX: --", font=("Arial",18), bg="white")
+time_text.pack(anchor="w", padx=20)
+
+alarm_btn = tk.Button(page2, text="Alarm OFF", font=("Arial",16), command=lambda: buzz_off())
+alarm_btn.pack(pady=10)
+
+tk.Button(page2, text="Back", font=("Arial",14),
+          command=lambda: page1.tkraise()).pack()
+
+selected_bot = None
+
+# ---- Refresh Table ----
+def refresh_table():
+    tree.delete(*tree.get_children())
+    now = time.time()
+
+    # remove inactive bots
+    remove = []
+    for b in bots:
+        if not bots[b]["is_demo"] and now - bots[b]["time"] > 30:
+            remove.append(b)
+    for r in remove:
+        del bots[r]
+
+    # display
+    for b in bots:
+        t = time.strftime("%H:%M:%S", time.localtime(bots[b]["time"]))
+        tree.insert("", "end", values=(b, bots[b]["status"], t))
+
+# ---- Load Dashboard ----
+def load_dashboard(name):
+    global selected_bot
+    selected_bot = name
+    bot = bots[name]
+
+    title.config(text=name)
+
+    status_text.config(text=f"Status: {bot['status']}")
+    temp_text.config(text=f"Temp: {bot['temp']} °C")
+    humi_text.config(text=f"Humidity: {bot['humi']} %")
+    fire_text.config(text=f"Fire: {bot['fire']}")
+    gps_text.config(text=f"GPS: {bot['gps']}")
+    time_text.config(text="TX: " + time.strftime("%H:%M:%S",time.localtime(bots[name]["time"])))
+
+    # alarms
+    buzz_off()
+    if bot["status"] == "ALERT":
+        buzz_on()
+    elif bot["status"] == "DANGEROUS":
+        buzz_on()
+
+# ---- Select in Table ----
+def on_select(e):
+    item = tree.selection()
+    if not item: return
+    name = tree.item(item)["values"][0]
+    load_dashboard(name)
+    page2.tkraise()
+
+tree.bind("<Double-1>", on_select)
+
+# ---- Demo bot auto-update ----
+def demo_loop():
+    while True:
+        for b in demo:
+            bots[b]["temp"] = round(25 + (time.time()%10),1)
+            bots[b]["humi"] = 50
+            bots[b]["gps"] = "3.011N,101.501E"
+            bots[b]["time"] = time.time()
+        refresh_table()
+        if selected_bot in demo:
+            load_dashboard(selected_bot)
+        time.sleep(3)
+
+threading.Thread(target=demo_loop, daemon=True).start()
+
+# ---- Start ----
+page1.tkraise()
+refresh_table()
+root.mainloop()
